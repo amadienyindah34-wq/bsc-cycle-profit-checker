@@ -1,0 +1,55 @@
+name: PancakeSwap Cycle Check
+
+# Give workflow permission to write repo contents so it can update docs/latest.txt
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/10 * * * *' # every 10 minutes — adjust as needed
+
+jobs:
+  run-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo (persist credentials)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run cycle checker and save output
+        env:
+          BSC_RPC: ${{ secrets.BSC_RPC }}
+          GAS_PRICE_GWEI: ${{ secrets.GAS_PRICE_GWEI }}
+          SLIPPAGE_PERCENT: ${{ secrets.SLIPPAGE_PERCENT }}
+          BASE_GAS: ${{ secrets.BASE_GAS }}
+          PER_SWAP_GAS: ${{ secrets.PER_SWAP_GAS }}
+        run: |
+          mkdir -p tmp
+          node index.js > tmp/result.txt 2>&1 || true
+          cat tmp/result.txt
+          cp tmp/result.txt docs/latest.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/latest.txt
+          if ! git diff --cached --quiet; then
+            git commit -m "ci: update latest run output"
+            git push origin HEAD:main
+          else
+            echo "No changes to docs/latest.txt"
+          fi
+
+      - name: Upload result artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pancake-check-result
+          path: docs/latest.txt
