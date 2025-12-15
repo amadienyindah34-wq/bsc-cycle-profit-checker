@@ -1,0 +1,143 @@
+// BSC cycle profit checker — safe version
+require('dotenv').config();
+const axios = require('axios');
+const { ethers } = require('ethers');
+
+const PANCAKE_TOKENLIST = 'https://tokens.pancakeswap.finance/pancakeswap-extended.json';
+const PANCAKE_ROUTER = '0x10ED43C718714eb63d5aA57B78B54704E256024E';
+const BSC_RPC = process.env.BSC_RPC || 'https://bsc-dataseed.binance.org/';
+
+const provider = new ethers.JsonRpcProvider(BSC_RPC);
+
+const ROUTER_ABI = [
+  'function getAmountsOut(uint256 amountIn, address[] memory path) view returns (uint256[] memory amounts)'
+];
+const ERC20_ABI = [
+  'function decimals() view returns (uint8)',
+  'function symbol() view returns (string)'
+];
+
+const router = new ethers.Contract(PANCAKE_ROUTER, ROUTER_ABI, provider);
+
+const SLIPPAGE_PERCENT = parseFloat(process.env.SLIPPAGE_PERCENT || '0.5');
+const GAS_PRICE_GWEI_OVERRIDE = process.env.GAS_PRICE_GWEI
+  ? BigInt(Math.round(parseFloat(process.env.GAS_PRICE_GWEI) * 1e9))
+  : null;
+const BASE_GAS = BigInt(parseInt(process.env.BASE_GAS || '120000', 10));
+const PER_SWAP_GAS = BigInt(parseInt(process.env.PER_SWAP_GAS || '60000', 10));
+
+async function fetchTokenList() {
+  try {
+    const res = await axios.get(PANCAKE_TOKENLIST, { timeout: 10000 });
+    return res.data.tokens || res.data;
+  } catch (e) {
+    console.error('Failed to fetch token list:', e.message);
+    return [];
+  }
+}
+
+function findTokenAddress(tokenList, symbol) {
+  if (!tokenList.length) return null;
+  const matches = tokenList.filter(t => t.symbol?.toUpperCase() === symbol.toUpperCase());
+  if (!matches.length) return null;
+  const forBSC = matches.find(t => Number(t.chainId) === 56);
+  return forBSC ? forBSC.address : matches[0].address;
+}
+
+async function getDecimals(address) {
+  try {
+    const token = new ethers.Contract(address, ERC20_ABI, provider);
+    return Number(await token.decimals());
+  } catch {
+    return 18;
+  }
+}
+
+function applySlippage(amount, slippagePercent) {
+  return (amount * BigInt(Math.round(10000 - slippagePercent * 100))) / 10000n;
+}
+
+async function getGasPriceWei() {
+  try {
+    return GAS_PRICE_GWEI_OVERRIDE || (await provider.getGasPrice());
+  } catch {
+    return 5_000_000_000n;
+  }
+}
+
+async function convertGasWeiToStartToken(gasWei, wbnb, start) {
+  try {
+    if (start.toLowerCase() === wbnb.toLowerCase()) return gasWei;
+    const amounts = await router.getAmountsOut(gasWei, [wbnb, start]);
+    return amounts.at(-1);
+  } catch {
+    return null;
+  }
+}
+
+async function checkPath(pathSymbols, startAmountStr = '1', tokenListCache = null) {
+  try {
+    const tokenList = tokenListCache || await fetchTokenList();
+    const addresses = [];
+
+    for (const sym of pathSymbols) {
+      const addr = findTokenAddress(tokenList, sym);
+      if (!addr) {
+        console.warn(`Token not found: ${sym}, skipping path.`);
+        return null;
+      }
+      addresses.push(ethers.getAddress(addr));
+    }
+
+    const wbnbAddr = findTokenAddress(tokenList, 'WBNB');
+    if (!wbnbAddr) return null;
+
+    const startAddr = addresses[0];
+    const decimals = await getDecimals(startAddr);
+    const amountIn = ethers.parseUnits(startAmountStr, decimals);
+
+    const amountsOut = await router.getAmountsOut(amountIn, addresses);
+    const finalAmount = applySlippage(amountsOut.at(-1), SLIPPAGE_PERCENT);
+
+    const swaps = addresses.length - 1;
+    const gasLimit = BASE_GAS + PER_SWAP_GAS * BigInt(swaps);
+    const gasPrice = await getGasPriceWei();
+    const gasCostWei = gasLimit * gasPrice;
+    const gasInStartToken = await convertGasWeiToStartToken(gasCostWei, wbnbAddr, startAddr);
+
+    const finalAfterCosts = gasInStartToken
+      ? finalAmount > gasInStartToken
+        ? finalAmount - gasInStartToken
+        : 0n
+      : finalAmount;
+
+    const profit = finalAfterCosts > amountIn ? finalAfterCosts - amountIn : 0n;
+
+    return { pathSymbols, profit, amountIn, finalAfterCosts, decimals };
+  } catch (e) {
+    console.error('Error in checkPath:', e.message);
+    return null;
+  }
+}
+
+(async () => {
+  const tokenList = await fetchTokenList();
+  const paths = [
+    ['WBNB', 'BUSD', 'USDT', 'WBNB'],
+    ['WBNB', 'USDT', 'BTCB', 'WBNB'],
+    ['WBNB', 'CAKE', 'BUSD', 'WBNB'],
+    ['BUSD', 'USDT', 'USDC', 'BUSD'],
+    ['WBNB', 'ETH', 'USDT', 'WBNB']
+  ];
+
+  const START_AMOUNTS = { 'WBNB': '0.01', 'BUSD': '10' };
+
+  for (const path of paths) {
+    const startAmt = START_AMOUNTS[path[0]] || '0.01';
+    const r = await checkPath(path, startAmt, tokenList);
+    if (!r) continue;
+    console.log(
+      `${path.join(' -> ')} | Start: ${startAmt} | Profit: ${ethers.formatUnits(r.profit, r.decimals)}`
+    );
+  }
+})();
